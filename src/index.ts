@@ -404,6 +404,7 @@ const provider: TaskSourceProvider = {
     const workspaceIdValue = workspaceId({ url });
     const payload = await getConversation(conversationId, workspaceIdValue);
     const conversation = asRecord(payload.conversation);
+    const contact = asRecord(payload.contact);
 
     return {
       provider: providerId,
@@ -415,7 +416,8 @@ const provider: TaskSourceProvider = {
       metadata: {
         workspaceId: workspaceIdValue,
         resolvedAt: new Date().toISOString(),
-        conversation
+        conversation,
+        contact
       }
     };
   },
