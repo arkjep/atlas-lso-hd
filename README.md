@@ -34,6 +34,8 @@ LSO_HD_WORKSPACE_ID=LST
 
 You can also set `LSO_HD_ACCESS_TOKEN` directly instead of `LSO_HD_PHONE` and `LSO_HD_PASSCODE`. The direct token is the same bearer token the web app stores as `@lsthd/accessToken`; when it is omitted, this module logs in lazily through the helpdesk API and caches the returned token in memory for the current ATLAS process.
 
+If a cached or configured token expires and the API returns `401`, the module clears its cached token, logs in again with `LSO_HD_PHONE` and `LSO_HD_PASSCODE`, and retries the request once.
+
 ## API Shape
 
 The provider uses the LST Help Desk tRPC API discovered from the deployed app:

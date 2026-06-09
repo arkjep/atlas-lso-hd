@@ -62,14 +62,18 @@ function passcode() {
   return env("LSO_HD_PASSCODE") || env("LSO_HD_PASSWORD");
 }
 
-async function accessToken() {
+function hasLoginCredentials() {
+  return Boolean(env("LSO_HD_PHONE") && passcode());
+}
+
+async function accessToken(forceLogin = false) {
   const value = configuredToken();
 
-  if (value) {
+  if (value && !forceLogin) {
     return value;
   }
 
-  if (cachedAccessToken) {
+  if (cachedAccessToken && !forceLogin) {
     return cachedAccessToken;
   }
 
@@ -113,10 +117,10 @@ function workspaceId(input?: { url?: string; ref?: TaskSourceResolvedRef }) {
     ?? env("LSO_HD_WORKSPACE_ID", "LST");
 }
 
-async function trpcHeaders(authenticated: boolean) {
+async function trpcHeaders(authenticated: boolean, forceLogin = false) {
   return {
     accept: "application/json",
-    ...(authenticated ? { authorization: `Bearer ${await accessToken()}` } : {})
+    ...(authenticated ? { authorization: `Bearer ${await accessToken(forceLogin)}` } : {})
   };
 }
 
@@ -124,17 +128,28 @@ function trpcInput(input: unknown) {
   return env("LSO_HD_TRPC_INPUT_FORMAT", "raw") === "json" ? { json: input } : input;
 }
 
-async function trpcRequest(path: string, init: RequestInit, url = `${trpcBaseUrl()}/${path}`, options?: { authenticated?: boolean }) {
+async function trpcRequest(path: string, init: RequestInit, url = `${trpcBaseUrl()}/${path}`, options?: { authenticated?: boolean; forceLogin?: boolean; retriedAuth?: boolean }) {
+  const authenticated = options?.authenticated ?? true;
   const response = await fetch(url, {
     ...init,
     headers: {
-      ...await trpcHeaders(options?.authenticated ?? true),
+      ...await trpcHeaders(authenticated, options?.forceLogin),
       ...(init.body ? { "content-type": "application/json" } : {}),
       ...(init.headers ?? {})
     }
   });
   const text = await response.text();
   const payload = text ? JSON.parse(text) as unknown : null;
+
+  if (response.status === 401 && authenticated && !options?.retriedAuth && hasLoginCredentials()) {
+    cachedAccessToken = null;
+
+    return trpcRequest(path, init, url, {
+      ...options,
+      forceLogin: true,
+      retriedAuth: true
+    });
+  }
 
   if (!response.ok) {
     throw new Error(`LSO helpdesk ${path} returned ${response.status}: ${text || response.statusText}`);
