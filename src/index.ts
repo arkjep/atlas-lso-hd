@@ -53,44 +53,61 @@ function env(name: string, fallback = "") {
   return process.env[name]?.trim() || fallback;
 }
 
-function requiredEnv(name: string) {
-  const value = env(name);
+function token() {
+  const value = env("LSO_HD_ACCESS_TOKEN") || env("LSO_HD_API_TOKEN");
 
   if (!value) {
-    throw new Error(`${name} is required for ${providerId}`);
+    throw new Error("LSO_HD_ACCESS_TOKEN is required for lso-helpdesk");
   }
 
   return value;
 }
 
-function ticketUrlPattern() {
-  return new RegExp(env("LSO_HD_URL_PATTERN", "/tickets?/([^/?#]+)"), "i");
+function trpcBaseUrl() {
+  return env("LSO_HD_TRPC_URL", env("LSO_HD_BASE_URL", "https://hd-api.lowstresstrading.com/trpc")).replace(/\/+$/, "");
 }
 
-function ticketIdFromUrl(url: string) {
-  const match = ticketUrlPattern().exec(url);
-  const rawTicketId = match?.[1];
-
-  return rawTicketId ? decodeURIComponent(rawTicketId) : null;
+function workspaceIdFromUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    const workspace = parsed.pathname.split("/").filter(Boolean)[0];
+    return workspace ? workspace.toUpperCase() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-function pathFor(template: string, ticketId: string) {
-  return template.replace(/:id\b/g, encodeURIComponent(ticketId));
+function conversationIdFromUrl(url: string) {
+  const pattern = new RegExp(env("LSO_HD_URL_PATTERN", "^https?://hd\\.lowstresstrading\\.com/([^/]+)/dashboard/conversation/([^/?#]+)"), "i");
+  const match = pattern.exec(url);
+  const conversationId = match?.[2] ?? match?.[1];
+
+  return conversationId ? decodeURIComponent(conversationId) : null;
 }
 
-function endpoint(pathTemplate: string, ticketId: string) {
-  const baseUrl = requiredEnv("LSO_HD_BASE_URL").replace(/\/+$/, "");
-  const path = pathFor(pathTemplate, ticketId);
-
-  return `${baseUrl}${path.startsWith("/") ? "" : "/"}${path}`;
+function workspaceId(input?: { url?: string; ref?: TaskSourceResolvedRef }) {
+  const metadata = asRecord(input?.ref?.metadata);
+  return stringValue(metadata.workspaceId)
+    ?? (input?.url ? workspaceIdFromUrl(input.url) : undefined)
+    ?? env("LSO_HD_WORKSPACE_ID", "LST");
 }
 
-async function helpdeskRequest(pathTemplate: string, ticketId: string, init: RequestInit = {}) {
-  const response = await fetch(endpoint(pathTemplate, ticketId), {
+function trpcHeaders() {
+  return {
+    accept: "application/json",
+    authorization: `Bearer ${token()}`
+  };
+}
+
+function trpcInput(input: unknown) {
+  return env("LSO_HD_TRPC_INPUT_FORMAT", "raw") === "json" ? { json: input } : input;
+}
+
+async function trpcRequest(path: string, init: RequestInit, url = `${trpcBaseUrl()}/${path}`) {
+  const response = await fetch(url, {
     ...init,
     headers: {
-      accept: "application/json",
-      authorization: `Bearer ${requiredEnv("LSO_HD_API_TOKEN")}`,
+      ...trpcHeaders(),
       ...(init.body ? { "content-type": "application/json" } : {}),
       ...(init.headers ?? {})
     }
@@ -99,7 +116,42 @@ async function helpdeskRequest(pathTemplate: string, ticketId: string, init: Req
   const payload = text ? JSON.parse(text) as unknown : null;
 
   if (!response.ok) {
-    throw new Error(`LSO helpdesk returned ${response.status}: ${text || response.statusText}`);
+    throw new Error(`LSO helpdesk ${path} returned ${response.status}: ${text || response.statusText}`);
+  }
+
+  return unwrapTrpcResponse(payload);
+}
+
+async function trpcQuery<T>(path: string, input: unknown): Promise<T> {
+  const url = new URL(`${trpcBaseUrl()}/${path}`);
+  url.searchParams.set("input", JSON.stringify(trpcInput(input)));
+
+  return trpcRequest(path, {
+    method: "GET",
+    headers: trpcHeaders(),
+    signal: AbortSignal.timeout(Number(env("LSO_HD_TIMEOUT_MS", "30000")))
+  }, url.href) as Promise<T>;
+}
+
+async function trpcMutate<T>(path: string, input: unknown): Promise<T> {
+  return trpcRequest(path, {
+    method: "POST",
+    body: JSON.stringify(trpcInput(input)),
+    signal: AbortSignal.timeout(Number(env("LSO_HD_TIMEOUT_MS", "30000")))
+  }) as Promise<T>;
+}
+
+function unwrapTrpcResponse(payload: unknown) {
+  const record = asRecord(payload);
+  const result = asRecord(record.result);
+  const data = asRecord(result.data);
+
+  if ("json" in data) {
+    return data.json;
+  }
+
+  if ("data" in result) {
+    return result.data;
   }
 
   return payload;
@@ -107,10 +159,6 @@ async function helpdeskRequest(pathTemplate: string, ticketId: string, init: Req
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function nestedRecord(value: unknown, key: string) {
-  return asRecord(asRecord(value)[key]);
 }
 
 function stringValue(value: unknown) {
@@ -121,79 +169,128 @@ function arrayValue(value: unknown) {
   return Array.isArray(value) ? value : [];
 }
 
-function ticketRecord(payload: unknown) {
-  const record = asRecord(payload);
-  return asRecord(record.ticket ?? record.data ?? payload);
+function stripHtml(value: string) {
+  return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function ticketTitle(ticket: Record<string, unknown>) {
-  return stringValue(ticket.subject)
-    ?? stringValue(ticket.title)
-    ?? stringValue(ticket.summary)
-    ?? stringValue(ticket.name);
+function idString(value: unknown) {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (value && typeof value === "object" && "toString" in value && typeof value.toString === "function") {
+    return value.toString();
+  }
+
+  return undefined;
 }
 
-function ticketStatus(ticket: Record<string, unknown>) {
-  return stringValue(ticket.status)
-    ?? stringValue(nestedRecord(ticket, "state").name);
+interface ConversationPayload {
+  conversation?: unknown;
+  contact?: unknown;
+  messages?: unknown;
 }
 
-function ticketMessages(ticketPayload: unknown, messagesPayload: unknown) {
-  const ticket = ticketRecord(ticketPayload);
-  const messagesRecord = asRecord(messagesPayload);
-  const messages = arrayValue(messagesRecord.messages)
-    .concat(arrayValue(messagesRecord.data))
-    .concat(arrayValue(ticket.messages))
-    .concat(arrayValue(ticket.thread))
-    .concat(arrayValue(ticket.conversation));
+async function getConversation(conversationId: string, workspaceId: string) {
+  return trpcQuery<ConversationPayload>("conversations.getConversation", {
+    conversationId,
+    workspaceId
+  });
+}
 
-  return messages.map((message, index): TaskSourceThreadMessage | null => {
+async function getCurrentUser() {
+  const fallbackUid = env("LSO_HD_AGENT_UID");
+  const fallbackName = env("LSO_HD_AGENT_NAME", "ATLAS");
+
+  if (fallbackUid) {
+    return {
+      uid: fallbackUid,
+      name: fallbackName
+    };
+  }
+
+  const user = await trpcQuery<Record<string, unknown>>("users.getUser", {
+    socialLairToken: token()
+  });
+
+  return {
+    uid: stringValue(user.uid) ?? stringValue(user._id) ?? stringValue(user.id) ?? fallbackUid ?? "",
+    name: stringValue(user.name) ?? stringValue(user.email) ?? fallbackName
+  };
+}
+
+function conversationTitle(conversation: Record<string, unknown>) {
+  return stringValue(conversation.title)
+    ?? stringValue(conversation.subject)
+    ?? stringValue(conversation._id);
+}
+
+function conversationStatus(conversation: Record<string, unknown>) {
+  return stringValue(conversation.status);
+}
+
+function contactEmails(contact: Record<string, unknown>) {
+  return arrayValue(contact.emails).filter((email): email is string => typeof email === "string" && email.includes("@"));
+}
+
+function messageSender(message: Record<string, unknown>, contact: Record<string, unknown>) {
+  return stringValue(message.sentByUserName)
+    ?? stringValue(message.sender)
+    ?? stringValue(message.from)
+    ?? stringValue(contact.name)
+    ?? contactEmails(contact)[0];
+}
+
+function messageHtml(message: Record<string, unknown>) {
+  return stringValue(message.html)
+    ?? stringValue(message.bodyHtml)
+    ?? stringValue(asRecord(message.rawWebhookData)["body-html"]);
+}
+
+function messageText(message: Record<string, unknown>) {
+  return stringValue(message.text)
+    ?? stringValue(message.body)
+    ?? stringValue(asRecord(message.rawWebhookData)["body-plain"])
+    ?? (messageHtml(message) ? stripHtml(messageHtml(message) ?? "") : undefined);
+}
+
+function conversationMessages(payload: ConversationPayload) {
+  const contact = asRecord(payload.contact);
+  const includeInternalNotes = env("LSO_HD_INCLUDE_INTERNAL_NOTES", "false").toLowerCase() === "true";
+
+  return arrayValue(payload.messages).map((message, index): TaskSourceThreadMessage | null => {
     const record = asRecord(message);
-    const sender = stringValue(record.sender)
-      ?? stringValue(record.from)
-      ?? stringValue(nestedRecord(record, "author").name)
-      ?? stringValue(nestedRecord(record, "user").name)
-      ?? stringValue(nestedRecord(record, "createdBy").name);
-    const text = stringValue(record.text)
-      ?? stringValue(record.body)
-      ?? stringValue(record.plainText)
-      ?? stringValue(record.message)
-      ?? stringValue(record.content);
-    const html = stringValue(record.html)
-      ?? stringValue(record.htmlBody);
+    const type = stringValue(record.type);
+
+    if (type === "NOTE" && !includeInternalNotes) {
+      return null;
+    }
+
+    const text = messageText(record);
+    const html = messageHtml(record);
 
     if (!text && !html) {
       return null;
     }
 
     return {
-      id: stringValue(record.id) ?? String(index + 1),
-      sender,
-      text: text ?? html?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() ?? "",
+      id: idString(record._id) ?? idString(record.id) ?? String(index + 1),
+      sender: messageSender(record, contact),
+      text: text ?? "",
       html,
-      date: stringValue(record.date) ?? stringValue(record.createdAt) ?? stringValue(record.created_at),
-      link: stringValue(record.url) ?? stringValue(record.link),
-      outgoing: Boolean(record.outgoing ?? record.isStaffReply ?? record.internal === false && sender?.includes(env("LSO_HD_AGENT_EMAIL", "\u0000")))
+      date: stringValue(record.createdAt) ?? stringValue(record.created_at) ?? stringValue(record.date),
+      outgoing: Boolean(record.sentByUserId || record.outgoing)
     };
   }).filter((message): message is TaskSourceThreadMessage => Boolean(message));
 }
 
-async function fetchTicket(ticketId: string) {
-  return helpdeskRequest(env("LSO_HD_TICKET_PATH", "/tickets/:id"), ticketId);
-}
+function replyHtml(message: string) {
+  const escaped = message
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 
-async function fetchMessages(ticketId: string) {
-  const path = env("LSO_HD_MESSAGES_PATH", "/tickets/:id/messages");
-
-  try {
-    return await helpdeskRequest(path, ticketId);
-  } catch (error) {
-    if (path === env("LSO_HD_TICKET_PATH", "/tickets/:id")) {
-      throw error;
-    }
-
-    return null;
-  }
+  return `<p>${escaped.replace(/\n{2,}/g, "</p><p>").replace(/\n/g, "<br />")}</p>`;
 }
 
 const provider: TaskSourceProvider = {
@@ -201,58 +298,77 @@ const provider: TaskSourceProvider = {
   name: "LSO Helpdesk",
 
   async resolveUrl({ url }) {
-    const ticketId = ticketIdFromUrl(url);
+    const conversationId = conversationIdFromUrl(url);
 
-    if (!ticketId) {
+    if (!conversationId) {
       return null;
     }
 
-    const payload = await fetchTicket(ticketId);
-    const ticket = ticketRecord(payload);
+    const workspaceIdValue = workspaceId({ url });
+    const payload = await getConversation(conversationId, workspaceIdValue);
+    const conversation = asRecord(payload.conversation);
 
     return {
       provider: providerId,
-      externalObjectType: "ticket",
-      externalObjectId: ticketId,
+      externalObjectType: "conversation",
+      externalObjectId: conversationId,
       externalUrl: url,
-      externalTitle: ticketTitle(ticket),
-      externalStatus: ticketStatus(ticket),
+      externalTitle: conversationTitle(conversation),
+      externalStatus: conversationStatus(conversation),
       metadata: {
+        workspaceId: workspaceIdValue,
         resolvedAt: new Date().toISOString(),
-        ticket
+        conversation
       }
     };
   },
 
   async fetchThread({ ref }) {
-    const ticketPayload = await fetchTicket(ref.externalObjectId);
-    const messagesPayload = await fetchMessages(ref.externalObjectId);
-    const ticket = ticketRecord(ticketPayload);
-    const messages = ticketMessages(ticketPayload, messagesPayload);
+    const workspaceIdValue = workspaceId({ ref });
+    const payload = await getConversation(ref.externalObjectId, workspaceIdValue);
+    const conversation = asRecord(payload.conversation);
 
     return {
-      title: ticketTitle(ticket) ?? ref.externalTitle,
-      messages,
-      raw: {
-        ticket: ticketPayload,
-        messages: messagesPayload
-      }
+      title: conversationTitle(conversation) ?? ref.externalTitle,
+      messages: conversationMessages(payload),
+      raw: payload
     };
   },
 
   async postCompletionReply({ ref, message }) {
-    return helpdeskRequest(env("LSO_HD_REPLY_PATH", "/tickets/:id/replies"), ref.externalObjectId, {
-      method: env("LSO_HD_REPLY_METHOD", "POST"),
-      body: JSON.stringify({ body: message })
+    const workspaceIdValue = workspaceId({ ref });
+    const payload = await getConversation(ref.externalObjectId, workspaceIdValue);
+    const contact = asRecord(payload.contact);
+    const currentUser = await getCurrentUser();
+    const email = env("LSO_HD_REPLY_TO_EMAIL") || contactEmails(contact)[0];
+
+    if (!email) {
+      throw new Error("No contact email is available for this conversation.");
+    }
+
+    if (!currentUser.uid) {
+      throw new Error("No LSO helpdesk user UID is available. Set LSO_HD_AGENT_UID.");
+    }
+
+    return trpcMutate("conversations.sendMessage", {
+      workspaceId: workspaceIdValue,
+      conversationId: ref.externalObjectId,
+      contactId: idString(contact._id) ?? idString(contact.id),
+      text: message.trim(),
+      html: replyHtml(message.trim()),
+      type: "EMAIL",
+      sentByUserId: currentUser.uid,
+      sentByUserName: currentUser.name,
+      email,
+      conversationStatus: env("LSO_HD_POST_SEND_STATUS", "")
     });
   },
 
   async markComplete({ ref }) {
-    const body = env("LSO_HD_COMPLETE_BODY", "{\"status\":\"completed\"}");
-
-    return helpdeskRequest(env("LSO_HD_COMPLETE_PATH", "/tickets/:id"), ref.externalObjectId, {
-      method: env("LSO_HD_COMPLETE_METHOD", "PATCH"),
-      body
+    return trpcMutate("conversations.updateConversationStatus", {
+      conversationId: ref.externalObjectId,
+      workspaceId: workspaceId({ ref }),
+      status: env("LSO_HD_COMPLETE_STATUS", "closed")
     });
   }
 };
