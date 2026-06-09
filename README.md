@@ -28,6 +28,40 @@ If a cached or configured token expires and the API returns `401`, the module cl
 
 When an ATLAS task with a linked helpdesk conversation is completed, this provider asks ATLAS to draft a completion reply and marks the helpdesk conversation closed. It does not send the email reply automatically.
 
+## How ATLAS Runs It
+
+ATLAS does not start this plugin as a separate server. The API discovers and imports the built module at:
+
+```txt
+plugins/atlas-lso-hd/dist/index.js
+```
+
+That means the normal local run sequence is:
+
+```sh
+cd plugins/atlas-lso-hd
+pnpm install
+pnpm build
+pnpm smoke
+
+cd ../..
+pnpm dev
+```
+
+Use `pnpm smoke` any time an agent or developer needs to answer "is the LSO HD plugin installed, built, and credentialed?" without starting all of ATLAS. It loads the same `dist/index.js` file ATLAS imports and checks for either `LSO_HD_ACCESS_TOKEN` or `LSO_HD_PHONE` plus `LSO_HD_PASSCODE`.
+
+To verify a specific helpdesk conversation end to end:
+
+```sh
+cd plugins/atlas-lso-hd
+pnpm build
+pnpm smoke -- https://hd.lowstresstrading.com/lst/dashboard/conversation/<conversationId>
+```
+
+That command resolves the URL, fetches the thread, and prints the conversation id, title, status, contact summary, message count, and a short preview of the latest messages.
+
+If ATLAS is already running and a task link is not syncing, rebuild this plugin and restart the API process. Task-source providers are imported once per API process.
+
 ## API Shape
 
 The provider uses the LST Help Desk tRPC API discovered from the deployed app:
