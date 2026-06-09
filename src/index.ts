@@ -1,3 +1,7 @@
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 interface AtlasTask {
   id: string;
   title: string;
@@ -41,6 +45,10 @@ interface TaskSourceThread {
 interface TaskSourceProvider {
   id: string;
   name?: string;
+  automation?: {
+    markCompleteOnTaskComplete?: boolean;
+    postCompletionReplyOnTaskComplete?: boolean;
+  };
   resolveUrl: (input: { url: string; task?: AtlasTask | null; user?: AtlasUser }) => Promise<TaskSourceResolvedRef | null>;
   fetchThread: (input: { ref: TaskSourceResolvedRef; task: AtlasTask; user: AtlasUser }) => Promise<TaskSourceThread | null>;
   postCompletionReply: (input: { ref: TaskSourceResolvedRef; task: AtlasTask; user: AtlasUser; message: string }) => Promise<unknown>;
@@ -48,7 +56,41 @@ interface TaskSourceProvider {
 }
 
 const providerId = "lso-helpdesk";
+const defaultTrpcBaseUrl = "https://hd-api.lowstresstrading.com/trpc";
+const defaultWorkspaceId = "LST";
+const completeStatus = "closed";
+const conversationUrlPattern = /^https?:\/\/hd\.lowstresstrading\.com\/([^/]+)\/dashboard\/conversation\/([^/?#]+)/i;
 let cachedAccessToken: string | null = null;
+
+function loadLocalEnv() {
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const envPath = path.resolve(moduleDir, "..", ".env");
+
+  if (!existsSync(envPath)) {
+    return;
+  }
+
+  for (const line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const trimmed = line.trim();
+
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const equalsIndex = trimmed.indexOf("=");
+
+    if (equalsIndex === -1) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, equalsIndex).trim();
+    const value = trimmed.slice(equalsIndex + 1).trim().replace(/^['"]|['"]$/g, "");
+
+    process.env[key] ??= value;
+  }
+}
+
+loadLocalEnv();
 
 function env(name: string, fallback = "") {
   return process.env[name]?.trim() || fallback;
@@ -89,7 +131,7 @@ async function accessToken(forceLogin = false) {
 }
 
 function trpcBaseUrl() {
-  return env("LSO_HD_TRPC_URL", env("LSO_HD_BASE_URL", "https://hd-api.lowstresstrading.com/trpc")).replace(/\/+$/, "");
+  return env("LSO_HD_TRPC_URL", env("LSO_HD_BASE_URL", defaultTrpcBaseUrl)).replace(/\/+$/, "");
 }
 
 function workspaceIdFromUrl(url: string) {
@@ -103,8 +145,7 @@ function workspaceIdFromUrl(url: string) {
 }
 
 function conversationIdFromUrl(url: string) {
-  const pattern = new RegExp(env("LSO_HD_URL_PATTERN", "^https?://hd\\.lowstresstrading\\.com/([^/]+)/dashboard/conversation/([^/?#]+)"), "i");
-  const match = pattern.exec(url);
+  const match = conversationUrlPattern.exec(url);
   const conversationId = match?.[2] ?? match?.[1];
 
   return conversationId ? decodeURIComponent(conversationId) : null;
@@ -114,7 +155,7 @@ function workspaceId(input?: { url?: string; ref?: TaskSourceResolvedRef }) {
   const metadata = asRecord(input?.ref?.metadata);
   return stringValue(metadata.workspaceId)
     ?? (input?.url ? workspaceIdFromUrl(input.url) : undefined)
-    ?? env("LSO_HD_WORKSPACE_ID", "LST");
+    ?? defaultWorkspaceId;
 }
 
 async function trpcHeaders(authenticated: boolean, forceLogin = false) {
@@ -348,6 +389,10 @@ function replyHtml(message: string) {
 const provider: TaskSourceProvider = {
   id: providerId,
   name: "LSO Helpdesk",
+  automation: {
+    markCompleteOnTaskComplete: true,
+    postCompletionReplyOnTaskComplete: false
+  },
 
   async resolveUrl({ url }) {
     const conversationId = conversationIdFromUrl(url);
@@ -426,7 +471,7 @@ const provider: TaskSourceProvider = {
     return trpcMutate("conversations.updateConversationStatus", {
       conversationId: ref.externalObjectId,
       workspaceId: workspaceId({ ref }),
-      status: env("LSO_HD_COMPLETE_STATUS", "closed")
+      status: completeStatus
     });
   }
 };
