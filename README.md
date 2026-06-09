@@ -25,11 +25,14 @@ TASK_SOURCE_AUTO_COMPLETE_EXTERNAL=true
 TASK_SOURCE_AUTO_SEND_COMPLETION_REPLIES=false
 
 LSO_HD_TRPC_URL=https://hd-api.lowstresstrading.com/trpc
-LSO_HD_ACCESS_TOKEN=...
+LSO_HD_PHONE=...
+LSO_HD_PASSCODE=...
 LSO_HD_WORKSPACE_ID=LST
 ```
 
 `TASK_SOURCE_AUTO_SEND_COMPLETION_REPLIES=false` means ATLAS will draft and store a reply on the task external ref, but this provider will not post it.
+
+You can also set `LSO_HD_ACCESS_TOKEN` directly instead of `LSO_HD_PHONE` and `LSO_HD_PASSCODE`. The direct token is the same bearer token the web app stores as `@lsthd/accessToken`; when it is omitted, this module logs in lazily through the helpdesk API and caches the returned token in memory for the current ATLAS process.
 
 ## API Shape
 
@@ -38,6 +41,9 @@ The provider uses the LST Help Desk tRPC API discovered from the deployed app:
 - `conversations.getConversation`
 - `conversations.sendMessage`
 - `conversations.updateConversationStatus`
+- `auth.checkPhone`
+- `auth.login`
+- `users.doLogin`
 - `users.getUser`
 
 Conversation URLs are expected to look like:
@@ -46,4 +52,4 @@ Conversation URLs are expected to look like:
 https://hd.lowstresstrading.com/lst/dashboard/conversation/<conversationId>
 ```
 
-Set `LSO_HD_ACCESS_TOKEN` to the same bearer token the web app stores as `@lsthd/accessToken`.
+The helpdesk login form calls the passcode a code, but the API expects it as `password`; this module maps `LSO_HD_PASSCODE` to that API field.

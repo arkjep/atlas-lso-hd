@@ -48,19 +48,40 @@ interface TaskSourceProvider {
 }
 
 const providerId = "lso-helpdesk";
+let cachedAccessToken: string | null = null;
 
 function env(name: string, fallback = "") {
   return process.env[name]?.trim() || fallback;
 }
 
-function token() {
-  const value = env("LSO_HD_ACCESS_TOKEN") || env("LSO_HD_API_TOKEN");
+function configuredToken() {
+  return env("LSO_HD_ACCESS_TOKEN") || env("LSO_HD_API_TOKEN");
+}
 
-  if (!value) {
-    throw new Error("LSO_HD_ACCESS_TOKEN is required for lso-helpdesk");
+function passcode() {
+  return env("LSO_HD_PASSCODE") || env("LSO_HD_PASSWORD");
+}
+
+async function accessToken() {
+  const value = configuredToken();
+
+  if (value) {
+    return value;
   }
 
-  return value;
+  if (cachedAccessToken) {
+    return cachedAccessToken;
+  }
+
+  const phone = env("LSO_HD_PHONE");
+  const password = passcode();
+
+  if (!phone || !password) {
+    throw new Error("Set LSO_HD_ACCESS_TOKEN, or set LSO_HD_PHONE and LSO_HD_PASSCODE for lso-helpdesk login.");
+  }
+
+  cachedAccessToken = await login(phone, password);
+  return cachedAccessToken;
 }
 
 function trpcBaseUrl() {
@@ -92,10 +113,10 @@ function workspaceId(input?: { url?: string; ref?: TaskSourceResolvedRef }) {
     ?? env("LSO_HD_WORKSPACE_ID", "LST");
 }
 
-function trpcHeaders() {
+async function trpcHeaders(authenticated: boolean) {
   return {
     accept: "application/json",
-    authorization: `Bearer ${token()}`
+    ...(authenticated ? { authorization: `Bearer ${await accessToken()}` } : {})
   };
 }
 
@@ -103,11 +124,11 @@ function trpcInput(input: unknown) {
   return env("LSO_HD_TRPC_INPUT_FORMAT", "raw") === "json" ? { json: input } : input;
 }
 
-async function trpcRequest(path: string, init: RequestInit, url = `${trpcBaseUrl()}/${path}`) {
+async function trpcRequest(path: string, init: RequestInit, url = `${trpcBaseUrl()}/${path}`, options?: { authenticated?: boolean }) {
   const response = await fetch(url, {
     ...init,
     headers: {
-      ...trpcHeaders(),
+      ...await trpcHeaders(options?.authenticated ?? true),
       ...(init.body ? { "content-type": "application/json" } : {}),
       ...(init.headers ?? {})
     }
@@ -122,23 +143,22 @@ async function trpcRequest(path: string, init: RequestInit, url = `${trpcBaseUrl
   return unwrapTrpcResponse(payload);
 }
 
-async function trpcQuery<T>(path: string, input: unknown): Promise<T> {
+async function trpcQuery<T>(path: string, input: unknown, options?: { authenticated?: boolean }): Promise<T> {
   const url = new URL(`${trpcBaseUrl()}/${path}`);
   url.searchParams.set("input", JSON.stringify(trpcInput(input)));
 
   return trpcRequest(path, {
     method: "GET",
-    headers: trpcHeaders(),
     signal: AbortSignal.timeout(Number(env("LSO_HD_TIMEOUT_MS", "30000")))
-  }, url.href) as Promise<T>;
+  }, url.href, options) as Promise<T>;
 }
 
-async function trpcMutate<T>(path: string, input: unknown): Promise<T> {
+async function trpcMutate<T>(path: string, input: unknown, options?: { authenticated?: boolean }): Promise<T> {
   return trpcRequest(path, {
     method: "POST",
     body: JSON.stringify(trpcInput(input)),
     signal: AbortSignal.timeout(Number(env("LSO_HD_TIMEOUT_MS", "30000")))
-  }) as Promise<T>;
+  }, undefined, options) as Promise<T>;
 }
 
 function unwrapTrpcResponse(payload: unknown) {
@@ -167,6 +187,22 @@ function stringValue(value: unknown) {
 
 function arrayValue(value: unknown) {
   return Array.isArray(value) ? value : [];
+}
+
+async function login(phone: string, password: string) {
+  const check = await trpcQuery<Record<string, unknown>>("auth.checkPhone", { phone }, { authenticated: false });
+  const exists = Boolean(check.exists);
+  const payload = exists
+    ? await trpcMutate<Record<string, unknown>>("auth.login", { phone, password }, { authenticated: false })
+    : await trpcQuery<Record<string, unknown>>("users.doLogin", { phone, password }, { authenticated: false });
+  const user = asRecord(payload.user);
+  const token = stringValue(user.accessToken);
+
+  if (!token) {
+    throw new Error("LSO helpdesk login did not return user.accessToken.");
+  }
+
+  return token;
 }
 
 function stripHtml(value: string) {
@@ -209,8 +245,9 @@ async function getCurrentUser() {
     };
   }
 
+  const token = await accessToken();
   const user = await trpcQuery<Record<string, unknown>>("users.getUser", {
-    socialLairToken: token()
+    socialLairToken: token
   });
 
   return {
@@ -350,7 +387,7 @@ const provider: TaskSourceProvider = {
       throw new Error("No LSO helpdesk user UID is available. Set LSO_HD_AGENT_UID.");
     }
 
-    return trpcMutate("conversations.sendMessage", {
+    const input: Record<string, unknown> = {
       workspaceId: workspaceIdValue,
       conversationId: ref.externalObjectId,
       contactId: idString(contact._id) ?? idString(contact.id),
@@ -359,9 +396,15 @@ const provider: TaskSourceProvider = {
       type: "EMAIL",
       sentByUserId: currentUser.uid,
       sentByUserName: currentUser.name,
-      email,
-      conversationStatus: env("LSO_HD_POST_SEND_STATUS", "")
-    });
+      email
+    };
+    const postSendStatus = env("LSO_HD_POST_SEND_STATUS");
+
+    if (postSendStatus) {
+      input.conversationStatus = postSendStatus;
+    }
+
+    return trpcMutate("conversations.sendMessage", input);
   },
 
   async markComplete({ ref }) {
