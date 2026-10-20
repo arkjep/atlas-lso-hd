@@ -81,3 +81,11 @@ https://hd.lowstresstrading.com/lst/dashboard/conversation/<conversationId>
 ```
 
 The helpdesk login form calls the passcode a code, but the API expects it as `password`; this module maps `LSO_HD_PASSCODE` to that API field.
+
+## Attachments
+
+Thread messages include URL-free `attachments` descriptors (id, name, MIME type, byte size and optional content ID), including messages with no text. `fetchAttachment({ ref, task, user, messageId, attachmentId })` re-fetches the authorized HelpDesk conversation and resolves only an attachment belonging to that message. Internal notes remain excluded unless explicitly configured.
+
+Downloads use HelpDesk's existing presign redirect endpoint, then the exact configured LST attachment storage hostname. They do not forward HelpDesk credentials, expose signed URLs, or save bytes. Limits: 20 descriptors per message, 10 MiB per file, 30 seconds per download, one controlled HTTPS redirect, matching MIME/size and PNG/JPEG/PDF signatures where applicable. Download errors omit upstream response bodies and URLs.
+
+Run `pnpm test` for mocked metadata, membership, redirect, size, MIME and credential-leakage regression tests. A live smoke fetch may display customer text; use summary-only checks when inspecting production conversations.

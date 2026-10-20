@@ -1,3 +1,4 @@
+import { messageAttachments, retrieveAttachment, type SourceAttachment } from "./attachments.js";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +28,7 @@ interface TaskSourceResolvedRef {
 }
 
 interface TaskSourceThreadMessage {
+  attachments?: SourceAttachment[];
   id?: string;
   sender?: string;
   text: string;
@@ -52,6 +54,7 @@ interface TaskSourceProvider {
   resolveUrl: (input: { url: string; task?: AtlasTask | null; user?: AtlasUser }) => Promise<TaskSourceResolvedRef | null>;
   fetchThread: (input: { ref: TaskSourceResolvedRef; task: AtlasTask; user: AtlasUser }) => Promise<TaskSourceThread | null>;
   postCompletionReply: (input: { ref: TaskSourceResolvedRef; task: AtlasTask; user: AtlasUser; message: string }) => Promise<unknown>;
+  fetchAttachment: (input: { ref: TaskSourceResolvedRef; task: AtlasTask; user: AtlasUser; messageId: string; attachmentId: string }) => Promise<{ attachment: SourceAttachment; data: Buffer }>;
   markComplete: (input: { ref: TaskSourceResolvedRef; task: AtlasTask; user: AtlasUser; draft?: string; replyPosted: boolean }) => Promise<unknown>;
 }
 
@@ -362,7 +365,8 @@ function conversationMessages(payload: ConversationPayload) {
     const text = messageText(record);
     const html = messageHtml(record);
 
-    if (!text && !html) {
+    const attachments = messageAttachments(record);
+    if (!text && !html && !attachments.length) {
       return null;
     }
 
@@ -370,6 +374,7 @@ function conversationMessages(payload: ConversationPayload) {
       id: idString(record._id) ?? idString(record.id) ?? String(index + 1),
       sender: messageSender(record, contact),
       text: text ?? "",
+      attachments,
       html,
       date: stringValue(record.createdAt) ?? stringValue(record.created_at) ?? stringValue(record.date),
       outgoing: Boolean(record.sentByUserId || record.outgoing)
@@ -432,6 +437,16 @@ const provider: TaskSourceProvider = {
       messages: conversationMessages(payload),
       raw: payload
     };
+  },
+
+  async fetchAttachment({ ref, messageId, attachmentId }) {
+    if (ref.provider !== providerId || ref.externalObjectType !== "conversation") throw new Error("Invalid HelpDesk reference");
+    const payload = await getConversation(ref.externalObjectId, workspaceId({ ref }));
+    const message = arrayValue(payload.messages).map(asRecord).find(record =>
+      (idString(record._id) ?? idString(record.id)) === messageId &&
+      (record.type !== "NOTE" || env("LSO_HD_INCLUDE_INTERNAL_NOTES", "false").toLowerCase() === "true"));
+    if (!message) throw new Error("Attachment message not found in conversation");
+    return retrieveAttachment(message, attachmentId);
   },
 
   async postCompletionReply({ ref, message }) {
