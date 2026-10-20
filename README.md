@@ -89,3 +89,27 @@ Thread messages include URL-free `attachments` descriptors (id, name, MIME type,
 Downloads use HelpDesk's existing presign redirect endpoint, then the exact configured LST attachment storage hostname. They do not forward HelpDesk credentials, expose signed URLs, or save bytes. Limits: 20 descriptors per message, 10 MiB per file, 30 seconds per download, one controlled HTTPS redirect, matching MIME/size and PNG/JPEG/PDF signatures where applicable. Download errors omit upstream response bodies and URLs.
 
 Run `pnpm test` for mocked metadata, membership, redirect, size, MIME and credential-leakage regression tests. A live smoke fetch may display customer text; use summary-only checks when inspecting production conversations.
+
+### Background API / assistant workflow
+
+The provider is a callable JavaScript API. An assistant with existing authorized Atlas host execution can import `plugins/atlas-lso-hd/dist/index.js` and call it directly. It uses the plugin's existing configured HelpDesk service authentication; no Atlas web login, browser session, Atlas bearer token or user download action is required.
+
+```js
+const { provider } = await import("/home/arkjep/apps/atlas/plugins/atlas-lso-hd/dist/index.js");
+// conversationUrl is the authorized ticket; task/user are the caller's existing task context.
+const ref = await provider.resolveUrl({ url: conversationUrl, task, user });
+if (!ref) throw new Error("Unrecognized HelpDesk conversation URL");
+const thread = await provider.fetchThread({ ref, task, user });
+for (const message of thread?.messages ?? []) {
+  for (const attachment of message.attachments ?? []) {
+    const { data, attachment: metadata } = await provider.fetchAttachment({
+      ref, task, user, messageId: message.id, attachmentId: attachment.id
+    });
+    // data is a complete Node Buffer, not a URL. Consume it locally:
+    // parse CSV bytes in memory, or write an owner-only temporary file for image/document tools.
+    // Do not log file contents, credentials or signed storage URLs. Remove temporary files after use.
+  }
+}
+```
+
+The caller must restrict requests to conversations authorized by its current task. `fetchAttachment` re-fetches the conversation and checks message/attachment membership before resolving bytes. Descriptors alone are metadata; actual analysis uses the returned `data` buffer. The Atlas work-session runner does not automatically fetch every source attachment: callers explicitly invoke the provider for the files needed by their task. The authenticated Atlas HTTP download route is optional and is not a prerequisite for background retrieval.
